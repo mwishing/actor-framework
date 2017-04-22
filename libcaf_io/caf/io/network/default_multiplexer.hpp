@@ -125,9 +125,11 @@ namespace network {
   constexpr int error_mask  = 0x04;
   // we use the shadow data to store the changeset for kqueue
   using multiplexer_data = struct kevent;
+  class event_handler;
   struct multiplexer_poll_shadow_data {
-    std::vector<struct kevent> changes;
-    size_t fds;
+    std::vector<struct kevent> changes; // changelist passed to kevent()
+    std::vector<event_handler*> errors;  // failed sockets to be deleted
+    size_t entries; // number of read/write-fd pairs
   };
 #elif !defined(CAF_LINUX) || defined(CAF_POLL_IMPL) // poll() multiplexer
 # ifdef CAF_WINDOWS

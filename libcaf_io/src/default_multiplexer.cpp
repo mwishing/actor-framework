@@ -303,13 +303,13 @@ namespace network {
       CAF_LOG_ERROR("kqueue: " << strerror(errno));
       CAF_CRITICAL("kevent() failed");
     }
-    shadow_.fds = 1;
+    shadow_.entries = 1;
   }
 
   void default_multiplexer::run() {
     CAF_LOG_TRACE("kqueue()-based multiplexer");
     pollset_.resize(20);
-    while (shadow_.fds > 0) {
+    while (shadow_.entries > 0) {
       int nev = kevent(loopfd_, shadow_.changes.data(),
                        static_cast<int>(shadow_.changes.size()),
                        pollset_.data(), static_cast<int>(pollset_.size()),
@@ -320,29 +320,54 @@ namespace network {
       if (nev < 0)
         switch (errno) {
           case EINTR:
+            shadow_.changes.clear(); // all changes guaranteed to be applied
             continue;
           default:
             CAF_LOG_ERROR("kevent: " << strerror(errno));
-            CAF_CRITICAL("kevent() failed");
         }
       shadow_.changes.clear();
       auto iter = pollset_.begin();
       auto last = iter + nev;
       for (; iter != last; ++iter) {
+        auto fd = static_cast<native_socket>(iter->ident);
         auto ptr = reinterpret_cast<event_handler*>(iter->udata);
         CAF_ASSERT(ptr != nullptr);
-        auto fd = static_cast<native_socket>(iter->ident);
-        if (!(iter->flags & EV_DELETE)) {
-          int mask = 0;
-          if (iter->filter == EVFILT_READ)
-            mask = input_mask;
-          else if (iter->filter == EVFILT_WRITE)
-            mask = output_mask;
-          if ((iter->flags & EV_ERROR) || (iter->flags & EV_EOF))
-            mask |= error_mask;
-          handle_socket_event(fd, mask, ptr);
+        if ((iter->flags & EV_ERROR) || (iter->flags & EV_EOF)) {
+          CAF_LOG_DEBUG("error occured on socket:"
+                        << CAF_ARG(fd) << CAF_ARG(last_socket_error())
+                        << CAF_ARG(last_socket_error_as_string()));
+          // Record event handler for later deletion. We cannot delete them
+          // here right away because the same event handler (and fd) may occur
+          // both in a read and write context, but become invalid after calling
+          // ptr->handle_event(operation::propagate_error). Therefore, we
+          // record the failed handler(s) first, and then call them later.
+          auto e = std::lower_bound(shadow_.errors.begin(),
+                                    shadow_.errors.end(), ptr);
+          if (e != shadow_.errors.end() && *e != ptr)
+            shadow_.errors.insert(e, ptr);
+          // Any pending events that relate the to-be-removed handler are no
+          // longer effective.
+          auto i = events_.begin();
+          while (i != events_.end() && i->fd == fd) {
+            i = events_.erase(i);
+            i = std::lower_bound(i, events_.end(), fd, event_less{});
+          }
+          // FIXME: if we uncomment this line, the tests run through but don't
+          // terminate.
+          --shadow_.entries;
+        } else if (iter->filter == EVFILT_READ && !ptr->read_channel_closed()) {
+          ptr->handle_event(operation::read);
+        } else if (iter->filter == EVFILT_WRITE) {
+          ptr->handle_event(operation::write);
+        } else {
+          CAF_ASSERT(!"unexpected kevent filter");
         }
       }
+      // Handle previously recorded error(s).
+      for (auto ptr : shadow_.errors)
+        ptr->handle_event(operation::propagate_error);
+      shadow_.errors.clear();
+      // Handle accumulated events.
       for (auto& me : events_)
         handle(me);
       events_.clear();
@@ -366,18 +391,17 @@ namespace network {
       struct kevent ke;
       EV_SET(&ke, e.fd, filter, flag, 0, 0, e.ptr);
       shadow_.changes.emplace_back(std::move(ke));
+      flag == EV_ADD ? ++shadow_.entries : --shadow_.entries;
     };
     if (e.mask == 0) {
       CAF_LOG_DEBUG("attempt to remove socket" << CAF_ARG(e.fd)
                     << "from kqueue");
-      --shadow_.fds;
       if (old & output_mask)
         kqueue_update(EV_DELETE, EVFILT_WRITE);
       if (old & input_mask)
         kqueue_update(EV_DELETE, EVFILT_READ);
     } else if (old == 0) {
       CAF_LOG_DEBUG("attempt to add socket" << CAF_ARG(e.fd) << "to kqueue");
-      ++shadow_.fds;
       if (e.mask & output_mask)
         kqueue_update(EV_ADD, EVFILT_WRITE);
       if (e.mask & input_mask)
